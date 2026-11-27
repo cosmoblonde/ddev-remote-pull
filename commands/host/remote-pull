@@ -17,7 +17,7 @@ Usage: ddev remote-pull <command>
 
   check [<source>]   ssh login, database and folders on the server; all sources without <source>
   sizes <source>     tables on the server by size, the ones pulled as structure only marked
-  sources            configured sources
+  sources            sources, the [sections] of the config
 
 Pulling:
   ddev pull live                    database and files from live (asks first)
@@ -27,14 +27,14 @@ Pulling:
   ddev pull live -y                 do not ask
 
 One run only, with --environment="NAME=value,NAME=value":
-  EMPTY_TABLES="<pattern> ..."   tables without rows, replaces the configured list
-  WITH_DATA="<pattern> ..."      these tables with rows although EMPTY_TABLES lists them
+  EMPTY_TABLES=<pattern> ...     tables without rows, replaces empty_tables of the config
+  WITH_DATA=<pattern> ...        these tables with rows although empty_tables lists them
   ALL_DATA=1                     all tables with rows
   BACKUP=0                       no backup of the local database
   DRY_RUN=1                      files: show what rsync would change, change nothing
   FILES_DELETE=1                 files: remove local files that are gone on the server
 
-Settings: .ddev/remote-pull/config (and config.local)
+Settings: .ddev/remote-pull/config and config.local, one [section] per source
 EOF
 }
 
@@ -44,7 +44,7 @@ case "${1:-}" in
       exec "$WORKER" check "$2"
     fi
     sources="$("$WORKER" sources)" || exit 1
-    [ -n "$sources" ] || { echo "No SOURCES in .ddev/remote-pull/config." >&2; exit 1; }
+    [ -n "$sources" ] || { echo "No [section] in .ddev/remote-pull/config." >&2; exit 1; }
     rc=0
     for s in $sources; do
       "$WORKER" check "$s" || rc=1

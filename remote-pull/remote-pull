@@ -9,7 +9,8 @@
 # Actions of "ddev remote-pull": sizes, check, sources.
 #
 # Settings come from .ddev/remote-pull/config (committed) and .ddev/remote-pull/config.local (personal, ignored by
-# git). A few of them can be set for one run with "ddev pull <source> --environment=NAME=value", see OVERRIDABLE.
+# git), INI files with one [section] per source. A few of them can be set for one run with
+# "ddev pull <source> --environment=NAME=value", see OVERRIDABLE.
 #
 # Runs on the host and stays compatible with bash 3.2 (macOS). Nothing here writes to the remote server: the remote
 # commands are mysql (SELECT on information_schema), mysqldump and rsync as sender.
@@ -49,21 +50,10 @@ step_done() {
 # configuration
 # ---------------------------------------------------------------------------------------------------------------------
 
-upper() {
-  printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_'
-}
-
-# value of <SOURCE>_<NAME>, falling back to <NAME>
-source_value() {
-  local var
-  var="$(upper "$SOURCE")_$1"
-  if [ -n "${!var:-}" ]; then
-    printf '%s' "${!var}"
-  else
-    var="$1"
-    printf '%s' "${!var:-}"
-  fi
-}
+# Settings of a source, from its section or the defaults before the first section
+SOURCE_KEYS="ssh port ssh_key db mysql_defaults root files files_exclude empty_tables with_data dump_options backup files_delete"
+# settings only allowed before the first section
+DEFAULT_KEYS="dump_dir"
 
 is_yes() {
   case "${1:-}" in
@@ -88,74 +78,135 @@ is_safe_path() {
   esac
 }
 
-load_config() {
-  local name saved=""
+# Reads an INI file: "key = value" lines, [section] headers, comments with # or ; at the start of a line.
+# Prints "<section><TAB><key><TAB><value>" per setting, "*" as section for the defaults before the first header and a
+# "<section><TAB>-<TAB>" line per header, so a section without settings still counts as a source. Values may be
+# quoted with "..." or '...'. The file is only read, never executed.
+parse_ini() {
+  awk -v file="${1#"$PROJECT_ROOT"/}" -v source_keys=" $SOURCE_KEYS " -v default_keys=" $DEFAULT_KEYS " '
+    function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
+    function fail(msg) { printf "%s:%d: %s\n", file, NR, msg > "/dev/stderr"; bad = 1 }
+    BEGIN { section = "*" }
+    { line = trim($0) }
+    line == "" || line ~ /^[#;]/ { next }
+    line ~ /^\[.*\]$/ {
+      section = trim(substr(line, 2, length(line) - 2))
+      if (section !~ /^[A-Za-z0-9_]+$/) fail("invalid section name [" section "], use letters, digits and _")
+      print section "\t-\t"
+      next
+    }
+    {
+      eq = index(line, "=")
+      if (eq == 0) { fail("expected \"key = value\": " line); next }
+      key = tolower(trim(substr(line, 1, eq - 1)))
+      value = trim(substr(line, eq + 1))
+      if (value ~ /^".*"$/ || value ~ /^\047.*\047$/) value = substr(value, 2, length(value) - 2)
+      if (index(value, "\t")) { fail("tab in the value of " key); next }
+      if (index(source_keys, " " key " ")) { print section "\t" key "\t" value; next }
+      if (index(default_keys, " " key " ")) {
+        if (section == "*") print section "\t" key "\t" value
+        else fail(key " belongs before the first section")
+        next
+      }
+      fail("unknown setting \"" key "\"")
+    }
+    END { exit bad }
+  ' "$1"
+}
 
-  # values from "ddev pull --environment" are exported before this script runs; keep them over the config files
-  for name in $OVERRIDABLE; do
-    if [ -n "${!name+x}" ]; then
-      saved="$saved $name"
-      eval "__saved_$name=\"\${$name}\""
+# value of <key> in <section>; prints it and succeeds when the key is there, also with an empty value.
+# The last match wins, so config.local, read after config, beats it.
+config_get() {
+  local want_section="$1" want_key="$2" section key value found=1 result=""
+  while IFS=$'\t' read -r section key value; do
+    if [ "$section" = "$want_section" ] && [ "$key" = "$want_key" ]; then
+      result="$value"
+      found=0
     fi
-  done
+  done <<< "$CONFIG"
+  [ "$found" -eq 0 ] && printf '%s' "$result"
+  return "$found"
+}
 
+# names given with "ddev pull --environment", see OVERRIDABLE
+is_overridden() {
+  case " $OVERRIDE_NAMES " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+
+# value of <key> for $SOURCE: run-time override <ENV_NAME>, the section of the source, the defaults, <default>
+setting() {
+  local key="$1" env_name="${2:-}" default="${3:-}"
+  if [ -n "$env_name" ] && is_overridden "$env_name"; then
+    printf '%s' "${!env_name}"
+    return
+  fi
+  config_get "$SOURCE" "$key" || config_get "*" "$key" || printf '%s' "$default"
+}
+
+load_config() {
+  local parsed
   [ -f "$ADDON_DIR/config" ] || die "no configuration: copy .ddev/remote-pull/config.dist to .ddev/remote-pull/config and fill in the sources"
-  # shellcheck disable=SC1091
-  . "$ADDON_DIR/config"
-  # shellcheck disable=SC1091
-  [ -f "$ADDON_DIR/config.local" ] && . "$ADDON_DIR/config.local"
+  parsed="$(parse_ini "$ADDON_DIR/config")" || die "fix .ddev/remote-pull/config first"
+  CONFIG="$parsed"
+  if [ -f "$ADDON_DIR/config.local" ]; then
+    parsed="$(parse_ini "$ADDON_DIR/config.local")" || die "fix .ddev/remote-pull/config.local first"
+    CONFIG="$CONFIG"$'\n'"$parsed"
+  fi
 
-  for name in $saved; do
-    eval "$name=\"\${__saved_$name}\""
-  done
+  # sections in the order of their first appearance
+  SOURCES=""
+  local section key value
+  while IFS=$'\t' read -r section key value; do
+    [ -n "$section" ] && [ "$section" != "*" ] || continue
+    case " $SOURCES " in *" $section "*) ;; *) SOURCES="${SOURCES:+$SOURCES }$section" ;; esac
+  done <<< "$CONFIG"
 
-  # personal key from the shell profile, beats both config files
-  [ -n "${REMOTE_PULL_SSH_KEY:-}" ] && SSH_KEY="$REMOTE_PULL_SSH_KEY"
-
-  SOURCES="${SOURCES:-}"
-  EMPTY_TABLES="${EMPTY_TABLES:-}"
-  WITH_DATA="${WITH_DATA:-}"
-  ALL_DATA="${ALL_DATA:-0}"
-  BACKUP="${BACKUP:-1}"
-  DRY_RUN="${DRY_RUN:-0}"
-  FILES_DELETE="${FILES_DELETE:-0}"
+  DUMP_DIR="$(config_get "*" dump_dir || true)"
   DUMP_DIR="${DUMP_DIR:-$HOME/ddev-remote-pull/$PROJECT_NAME}"
   case "$DUMP_DIR" in "~/"*) DUMP_DIR="$HOME/${DUMP_DIR#\~/}" ;; esac
+  # only run-time options, not part of the config files
+  ALL_DATA="${ALL_DATA:-0}"
+  DRY_RUN="${DRY_RUN:-0}"
 }
 
 # reads and validates the settings of $SOURCE
 load_source() {
-  local s
   is_safe_name "$SOURCE" || die "invalid source name: $SOURCE"
-  s=" $SOURCES "
-  case "$s" in
+  case " $SOURCES " in
     *" $SOURCE "*) ;;
-    *) die "source '$SOURCE' is not listed in SOURCES of .ddev/remote-pull/config (listed: ${SOURCES:-none})" ;;
+    *) die "no section [$SOURCE] in .ddev/remote-pull/config (sections: ${SOURCES:-none})" ;;
   esac
 
-  SSH_TARGET="$(source_value SSH)"
-  SSH_PORT="$(source_value PORT)"
-  SSH_KEY_USED="$(source_value SSH_KEY)"
+  SSH_TARGET="$(setting ssh)"
+  SSH_PORT="$(setting port)"
+  SSH_KEY_USED="$(setting ssh_key)"
+  # personal key from the shell profile, beats both config files
   [ -n "${REMOTE_PULL_SSH_KEY:-}" ] && SSH_KEY_USED="$REMOTE_PULL_SSH_KEY"
-  REMOTE_DB="$(source_value DB)"
-  MYSQL_DEFAULTS="$(source_value MYSQL_DEFAULTS)"
-  REMOTE_ROOT="$(source_value ROOT)"
-  FILES="$(source_value FILES)"
-  FILES_EXCLUDE="$(source_value FILES_EXCLUDE)"
-  SOURCE_EMPTY_TABLES="$(source_value EMPTY_TABLES)"
-  # a run-time EMPTY_TABLES replaces the per-source list as well
-  case " $OVERRIDE_NAMES " in *" EMPTY_TABLES "*) SOURCE_EMPTY_TABLES="$EMPTY_TABLES" ;; esac
+  REMOTE_DB="$(setting db)"
+  MYSQL_DEFAULTS="$(setting mysql_defaults)"
+  REMOTE_ROOT="$(setting root)"
+  FILES="$(setting files)"
+  FILES_EXCLUDE="$(setting files_exclude)"
+  DUMP_OPTIONS="$(setting dump_options)"
+  EMPTY_TABLES="$(setting empty_tables EMPTY_TABLES)"
+  WITH_DATA="$(setting with_data WITH_DATA)"
+  BACKUP="$(setting backup BACKUP 1)"
+  FILES_DELETE="$(setting files_delete FILES_DELETE 0)"
 
-  [ -n "$SSH_TARGET" ] || die "$(upper "$SOURCE")_SSH is not set (user@host or a Host of ~/.ssh/config)"
+  [ -n "$SSH_TARGET" ] || die "ssh is not set in [$SOURCE] (user@host or a Host of ~/.ssh/config)"
   case "$SSH_TARGET" in
-    -*|*[!A-Za-z0-9_.@-]*) die "invalid $(upper "$SOURCE")_SSH: $SSH_TARGET" ;;
+    -*|*[!A-Za-z0-9_.@-]*) die "invalid ssh in [$SOURCE]: $SSH_TARGET" ;;
   esac
   if [ -n "$SSH_PORT" ]; then
-    case "$SSH_PORT" in *[!0-9]*) die "invalid $(upper "$SOURCE")_PORT: $SSH_PORT" ;; esac
+    case "$SSH_PORT" in *[!0-9]*) die "invalid port in [$SOURCE]: $SSH_PORT" ;; esac
   fi
-  [ -z "$REMOTE_DB" ] || is_safe_name "$REMOTE_DB" || die "invalid $(upper "$SOURCE")_DB: $REMOTE_DB"
-  [ -z "$MYSQL_DEFAULTS" ] || is_safe_path "$MYSQL_DEFAULTS" || die "invalid $(upper "$SOURCE")_MYSQL_DEFAULTS: $MYSQL_DEFAULTS"
-  [ -z "$REMOTE_ROOT" ] || is_safe_path "$REMOTE_ROOT" || die "invalid $(upper "$SOURCE")_ROOT: $REMOTE_ROOT"
+  [ -z "$REMOTE_DB" ] || is_safe_name "$REMOTE_DB" || die "invalid db in [$SOURCE]: $REMOTE_DB"
+  [ -z "$MYSQL_DEFAULTS" ] || is_safe_path "$MYSQL_DEFAULTS" || die "invalid mysql_defaults in [$SOURCE]: $MYSQL_DEFAULTS"
+  [ -z "$REMOTE_ROOT" ] || is_safe_path "$REMOTE_ROOT" || die "invalid root in [$SOURCE]: $REMOTE_ROOT"
+  # dump_options go into the remote command line unquoted: options only, no shell syntax
+  case "$DUMP_OPTIONS" in
+    *[!A-Za-z0-9_=,.\ -]*) die "invalid dump_options in [$SOURCE]: $DUMP_OPTIONS" ;;
+  esac
 
   case "$SSH_KEY_USED" in "~/"*) SSH_KEY_USED="$HOME/${SSH_KEY_USED#\~/}" ;; esac
 
@@ -164,7 +215,7 @@ load_source() {
   SSH_OPTS=(-o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no)
   [ -n "$SSH_PORT" ] && SSH_OPTS+=(-p "$SSH_PORT")
   if [ -n "$SSH_KEY_USED" ]; then
-    [ -f "$SSH_KEY_USED" ] || die "SSH key not found: $SSH_KEY_USED (SSH_KEY, $(upper "$SOURCE")_SSH_KEY or REMOTE_PULL_SSH_KEY)"
+    [ -f "$SSH_KEY_USED" ] || die "SSH key not found: $SSH_KEY_USED (ssh_key or REMOTE_PULL_SSH_KEY)"
     SSH_OPTS+=(-i "$SSH_KEY_USED" -o IdentitiesOnly=yes -o PreferredAuthentications=publickey)
   fi
 
@@ -217,9 +268,9 @@ add_mb() {
 # reads the table list of the remote database and sorts it into EMPTIED and the sizes
 resolve_tables() {
   local query table mb rows mark pattern found
-  [ -n "$REMOTE_DB" ] || die "$(upper "$SOURCE")_DB is not set"
+  [ -n "$REMOTE_DB" ] || die "db is not set in [$SOURCE]"
 
-  EMPTY_LIST="${SOURCE_EMPTY_TABLES//,/ }"
+  EMPTY_LIST="${EMPTY_TABLES//,/ }"
   WITH_LIST="${WITH_DATA//,/ }"
   is_yes "$ALL_DATA" && EMPTY_LIST=""
 
@@ -255,7 +306,7 @@ resolve_tables() {
       # shellcheck disable=SC2254
       case "$table" in $pattern) found=1; break ;; esac
     done <<< "$TABLES"
-    [ "$found" = 1 ] || echo "    note: EMPTY_TABLES entry '$pattern' matches no table on $SOURCE"
+    [ "$found" = 1 ] || echo "    note: empty_tables entry '$pattern' matches no table on $SOURCE"
   done
 }
 
@@ -298,7 +349,7 @@ action_db() {
   stamp="$(date +%Y%m%d-%H%M%S)"
   file="$DUMP_DIR/$SOURCE--$stamp.sql.gz"
 
-  dump_opts="--single-transaction --quick --no-tablespaces --default-character-set=utf8mb4 ${DUMP_OPTIONS:-}"
+  dump_opts="--single-transaction --quick --no-tablespaces --default-character-set=utf8mb4 $DUMP_OPTIONS"
   if [ -n "$EMPTIED" ]; then
     ignore=""
     for table in $EMPTIED; do ignore="$ignore --ignore-table=$REMOTE_DB.$table"; done
@@ -342,7 +393,7 @@ action_import() {
     step_done
     echo "    saved: $backup ($(du -h "$backup" | cut -f1))"
   else
-    echo "    no backup of the local database (BACKUP=0)"
+    echo "    no backup of the local database (backup = 0)"
   fi
 
   # ddev pull runs pre-import-db and post-import-db around this action, so the nested import skips them
@@ -358,10 +409,10 @@ action_import() {
 action_files() {
   local path opts pattern rsh
   if [ -z "$FILES" ]; then
-    echo "    no $(upper "$SOURCE")_FILES or FILES configured, no files pulled"
+    echo "    no files configured for [$SOURCE], no files pulled"
     return 0
   fi
-  [ -n "$REMOTE_ROOT" ] || die "$(upper "$SOURCE")_ROOT is not set (project root on the server)"
+  [ -n "$REMOTE_ROOT" ] || die "root is not set in [$SOURCE] (project root on the server)"
   command -v rsync >/dev/null 2>&1 || die "rsync is not installed on this computer"
 
   # rsync takes the ssh options as one string
@@ -377,8 +428,8 @@ action_files() {
 
   for path in $FILES; do
     path="${path%/}"
-    case "$path" in /*) die "FILES entries are relative to the project root: $path" ;; esac
-    is_safe_path "$path" || die "invalid FILES entry: $path"
+    case "$path" in /*) die "files are relative to the project root: $path" ;; esac
+    is_safe_path "$path" || die "invalid entry in files: $path"
     mkdir -p "$PROJECT_ROOT/$path"
     step "rsync $SOURCE:$REMOTE_ROOT/$path/ -> $path/$(is_yes "$DRY_RUN" && echo ' (dry run, nothing changed)')"
     rsync "${opts[@]}" "$SSH_TARGET:$REMOTE_ROOT/$path/" "$PROJECT_ROOT/$path/" || die "rsync of $path failed"
@@ -422,7 +473,7 @@ action_check() {
       && echo "  [OK]   mysqldump and gzip on the server" \
       || { echo "  [FAIL] mysqldump or gzip missing on the server"; ok=1; }
   else
-    echo "  [--]   no $(upper "$SOURCE")_DB, database pull not configured"
+    echo "  [--]   no db, database pull not configured"
   fi
 
   if [ -n "$FILES" ]; then
@@ -439,7 +490,7 @@ action_check() {
       fi
     done
   else
-    echo "  [--]   no FILES, file pull not configured"
+    echo "  [--]   no files, file pull not configured"
   fi
   return $ok
 }

@@ -1,8 +1,9 @@
 #ddev-generated
-# "ddev pull stage": database and files from the source "stage" of .ddev/remote-pull/config.
+# "ddev pull stage": database and files from the section [stage] of .ddev/remote-pull/config.
 # Every step runs on the host, so ssh uses your own keys, ssh-agent and ~/.ssh/config.
 # One run only: ddev pull stage --environment="EMPTY_TABLES=cache_* sys_log,BACKUP=0"
-# More sources: copy this file under the new name, replace "stage" and remove the #ddev-generated line.
+# More sources: copy this file under the name of the new section, replace "stage" and remove the
+# #ddev-generated line.
 
 info_command:
   command: .ddev/remote-pull/remote-pull info stage

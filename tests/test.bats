@@ -62,15 +62,22 @@ write_config() {
   echo "image" > "${TESTDIR}/server/public/fileadmin/image.txt"
   echo "thumb" > "${TESTDIR}/server/public/fileadmin/_processed_/thumb.txt"
   cat > .ddev/remote-pull/config <<EOF
-SOURCES="live stage"
-LIVE_SSH="user@live.example.com"
-LIVE_PORT="2222"
-LIVE_DB="db"
-LIVE_ROOT="${TESTDIR}/server"
-EMPTY_TABLES="sys_log cache_* not_there_*"
-FILES="public/fileadmin"
-FILES_EXCLUDE="_processed_"
-DUMP_DIR="${DUMPS}"
+# defaults
+empty_tables = sys_log cache_* not_there_*
+files = public/fileadmin
+files_exclude = "_temp_"
+dump_dir = ${DUMPS}
+
+[live]
+ssh = user@live.example.com
+port = 2222
+db = db
+root = ${TESTDIR}/server
+; the section beats the defaults
+files_exclude = '_processed_'
+
+[stage]
+ssh =
 EOF
 }
 
@@ -130,24 +137,54 @@ teardown() {
   # the fresh config has no ssh target
   run ddev pull live -y --skip-files
   assert_failure
-  assert_output --partial "LIVE_SSH is not set"
+  assert_output --partial "ssh is not set in [live]"
 
   write_config
-  # a source that is not listed
+  # a source without a section
   run ddev remote-pull check prod
   assert_failure
-  assert_output --partial "source 'prod' is not listed"
+  assert_output --partial "no section [prod]"
 
-  # listed, but not configured
+  # a section without an ssh target
   run ddev remote-pull check stage
   assert_failure
-  assert_output --partial "STAGE_SSH is not set"
+  assert_output --partial "ssh is not set in [stage]"
 
-  # values end up in a remote command line
-  echo 'LIVE_DB="db; rm -rf /"' >> .ddev/remote-pull/config
+  # config.local beats config; values end up in a remote command line
+  printf '[live]\ndb = db; rm -rf /\n' > .ddev/remote-pull/config.local
   run ddev remote-pull check live
   assert_failure
-  assert_output --partial "invalid LIVE_DB"
+  assert_output --partial "invalid db in [live]"
+  rm .ddev/remote-pull/config.local
+
+  # the parser names the line of a typo
+  printf 'emty_tables = x\n' >> .ddev/remote-pull/config
+  run ddev remote-pull check live
+  assert_failure
+  assert_output --partial 'unknown setting "emty_tables"'
+  write_config
+  printf 'no equals sign\n' >> .ddev/remote-pull/config
+  run ddev remote-pull check live
+  assert_failure
+  assert_output --partial 'expected "key = value"'
+  write_config
+  printf 'dump_dir = /tmp\n' >> .ddev/remote-pull/config
+  run ddev remote-pull check live
+  assert_failure
+  assert_output --partial "dump_dir belongs before the first section"
+
+  # the config is read, not executed
+  write_config
+  printf '[live]\nroot = $(touch %s/executed)\n' "${TESTDIR}" >> .ddev/remote-pull/config
+  run ddev remote-pull check live
+  assert_failure
+  assert_output --partial "invalid root in [live]"
+  assert_file_not_exist "${TESTDIR}/executed"
+
+  write_config
+  run ddev remote-pull sources
+  assert_success
+  assert_output "live stage"
 }
 
 @test "check and sizes" {
@@ -168,7 +205,7 @@ teardown() {
   assert_success
   assert_output --regexp "sys_log +structure only"
   assert_output --regexp "cache_pages +structure only"
-  assert_output --partial "note: EMPTY_TABLES entry 'not_there_*' matches no table on live"
+  assert_output --partial "note: empty_tables entry 'not_there_*' matches no table on live"
   refute_output --regexp "keep +structure only"
 }
 
