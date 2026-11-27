@@ -1,0 +1,31 @@
+#ddev-generated
+# "ddev pull live": database and files from the source "live" of .ddev/remote-pull/config.
+# Every step runs on the host, so ssh uses your own keys, ssh-agent and ~/.ssh/config.
+# One run only: ddev pull live --environment="EMPTY_TABLES=cache_* sys_log,BACKUP=0"
+# More sources: copy this file under the new name, replace "live" and remove the #ddev-generated line.
+
+info_command:
+  command: .ddev/remote-pull/remote-pull info live
+  service: host
+
+auth_command:
+  command: .ddev/remote-pull/remote-pull auth live
+  service: host
+
+db_pull_command:
+  command: .ddev/remote-pull/remote-pull db live
+  service: host
+
+# backup of the local database, then ddev import-db; ddev pull runs the import-db hooks around it
+db_import_command:
+  command: .ddev/remote-pull/remote-pull import live
+  service: host
+
+# nothing to download first: the import step syncs straight into the project with rsync
+files_pull_command:
+  command: "true"
+  service: host
+
+files_import_command:
+  command: .ddev/remote-pull/remote-pull files live
+  service: host

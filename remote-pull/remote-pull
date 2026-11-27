@@ -1,0 +1,489 @@
+#!/usr/bin/env bash
+#ddev-generated
+# Worker of the remote-pull add-on. The providers in .ddev/providers/ (ddev pull <source>) and the host command
+# "ddev remote-pull" call it, always on the host and from the project root:
+#
+#   remote-pull <action> <source>
+#
+# Actions used by the providers: info, auth, db, import, files.
+# Actions of "ddev remote-pull": sizes, check, sources.
+#
+# Settings come from .ddev/remote-pull/config (committed) and .ddev/remote-pull/config.local (personal, ignored by
+# git). A few of them can be set for one run with "ddev pull <source> --environment=NAME=value", see OVERRIDABLE.
+#
+# Runs on the host and stays compatible with bash 3.2 (macOS). Nothing here writes to the remote server: the remote
+# commands are mysql (SELECT on information_schema), mysqldump and rsync as sender.
+
+set -o nounset -o pipefail
+# table patterns like cache_* must never expand to local file names
+set -f
+
+ADDON_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="${DDEV_APPROOT:-$(cd "$ADDON_DIR/../.." && pwd)}"
+PROJECT_NAME="${DDEV_SITENAME:-$(basename "$PROJECT_ROOT")}"
+DOWNLOAD_DIR="$PROJECT_ROOT/.ddev/.downloads"
+
+# settings that "--environment=NAME=value" of ddev pull may override for one run
+OVERRIDABLE="EMPTY_TABLES WITH_DATA ALL_DATA BACKUP DRY_RUN FILES_DELETE"
+
+die() {
+  echo "remote-pull: $*" >&2
+  exit 1
+}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# output
+# ---------------------------------------------------------------------------------------------------------------------
+
+STEP_START=0
+step() {
+  echo "==> $*"
+  STEP_START=$SECONDS
+}
+step_done() {
+  local s=$((SECONDS - STEP_START))
+  printf '    done in %dm %02ds\n' $((s / 60)) $((s % 60))
+}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# configuration
+# ---------------------------------------------------------------------------------------------------------------------
+
+upper() {
+  printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_'
+}
+
+# value of <SOURCE>_<NAME>, falling back to <NAME>
+source_value() {
+  local var
+  var="$(upper "$SOURCE")_$1"
+  if [ -n "${!var:-}" ]; then
+    printf '%s' "${!var}"
+  else
+    var="$1"
+    printf '%s' "${!var:-}"
+  fi
+}
+
+is_yes() {
+  case "${1:-}" in
+    1|y|Y|yes|YES|true|TRUE) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# names go into a remote shell command line: allow nothing but [A-Za-z0-9_]
+is_safe_name() {
+  case "$1" in
+    ''|*[!A-Za-z0-9_]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# paths go into a remote shell command line as well; no spaces, no quotes, no ".."
+is_safe_path() {
+  case "$1" in
+    ''|*[!A-Za-z0-9_./~@+-]*|*..*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+load_config() {
+  local name saved=""
+
+  # values from "ddev pull --environment" are exported before this script runs; keep them over the config files
+  for name in $OVERRIDABLE; do
+    if [ -n "${!name+x}" ]; then
+      saved="$saved $name"
+      eval "__saved_$name=\"\${$name}\""
+    fi
+  done
+
+  [ -f "$ADDON_DIR/config" ] || die "no configuration: copy .ddev/remote-pull/config.dist to .ddev/remote-pull/config and fill in the sources"
+  # shellcheck disable=SC1091
+  . "$ADDON_DIR/config"
+  # shellcheck disable=SC1091
+  [ -f "$ADDON_DIR/config.local" ] && . "$ADDON_DIR/config.local"
+
+  for name in $saved; do
+    eval "$name=\"\${__saved_$name}\""
+  done
+
+  # personal key from the shell profile, beats both config files
+  [ -n "${REMOTE_PULL_SSH_KEY:-}" ] && SSH_KEY="$REMOTE_PULL_SSH_KEY"
+
+  SOURCES="${SOURCES:-}"
+  EMPTY_TABLES="${EMPTY_TABLES:-}"
+  WITH_DATA="${WITH_DATA:-}"
+  ALL_DATA="${ALL_DATA:-0}"
+  BACKUP="${BACKUP:-1}"
+  DRY_RUN="${DRY_RUN:-0}"
+  FILES_DELETE="${FILES_DELETE:-0}"
+  DUMP_DIR="${DUMP_DIR:-$HOME/ddev-remote-pull/$PROJECT_NAME}"
+  case "$DUMP_DIR" in "~/"*) DUMP_DIR="$HOME/${DUMP_DIR#\~/}" ;; esac
+}
+
+# reads and validates the settings of $SOURCE
+load_source() {
+  local s
+  is_safe_name "$SOURCE" || die "invalid source name: $SOURCE"
+  s=" $SOURCES "
+  case "$s" in
+    *" $SOURCE "*) ;;
+    *) die "source '$SOURCE' is not listed in SOURCES of .ddev/remote-pull/config (listed: ${SOURCES:-none})" ;;
+  esac
+
+  SSH_TARGET="$(source_value SSH)"
+  SSH_PORT="$(source_value PORT)"
+  SSH_KEY_USED="$(source_value SSH_KEY)"
+  [ -n "${REMOTE_PULL_SSH_KEY:-}" ] && SSH_KEY_USED="$REMOTE_PULL_SSH_KEY"
+  REMOTE_DB="$(source_value DB)"
+  MYSQL_DEFAULTS="$(source_value MYSQL_DEFAULTS)"
+  REMOTE_ROOT="$(source_value ROOT)"
+  FILES="$(source_value FILES)"
+  FILES_EXCLUDE="$(source_value FILES_EXCLUDE)"
+  SOURCE_EMPTY_TABLES="$(source_value EMPTY_TABLES)"
+  # a run-time EMPTY_TABLES replaces the per-source list as well
+  case " $OVERRIDE_NAMES " in *" EMPTY_TABLES "*) SOURCE_EMPTY_TABLES="$EMPTY_TABLES" ;; esac
+
+  [ -n "$SSH_TARGET" ] || die "$(upper "$SOURCE")_SSH is not set (user@host or a Host of ~/.ssh/config)"
+  case "$SSH_TARGET" in
+    -*|*[!A-Za-z0-9_.@-]*) die "invalid $(upper "$SOURCE")_SSH: $SSH_TARGET" ;;
+  esac
+  if [ -n "$SSH_PORT" ]; then
+    case "$SSH_PORT" in *[!0-9]*) die "invalid $(upper "$SOURCE")_PORT: $SSH_PORT" ;; esac
+  fi
+  [ -z "$REMOTE_DB" ] || is_safe_name "$REMOTE_DB" || die "invalid $(upper "$SOURCE")_DB: $REMOTE_DB"
+  [ -z "$MYSQL_DEFAULTS" ] || is_safe_path "$MYSQL_DEFAULTS" || die "invalid $(upper "$SOURCE")_MYSQL_DEFAULTS: $MYSQL_DEFAULTS"
+  [ -z "$REMOTE_ROOT" ] || is_safe_path "$REMOTE_ROOT" || die "invalid $(upper "$SOURCE")_ROOT: $REMOTE_ROOT"
+
+  case "$SSH_KEY_USED" in "~/"*) SSH_KEY_USED="$HOME/${SSH_KEY_USED#\~/}" ;; esac
+
+  # no terminal for the providers: a password or passphrase prompt would hang, so fail instead.
+  # With a key: offer that key only, even if the agent holds more.
+  SSH_OPTS=(-o BatchMode=yes -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no)
+  [ -n "$SSH_PORT" ] && SSH_OPTS+=(-p "$SSH_PORT")
+  if [ -n "$SSH_KEY_USED" ]; then
+    [ -f "$SSH_KEY_USED" ] || die "SSH key not found: $SSH_KEY_USED (SSH_KEY, $(upper "$SOURCE")_SSH_KEY or REMOTE_PULL_SSH_KEY)"
+    SSH_OPTS+=(-i "$SSH_KEY_USED" -o IdentitiesOnly=yes -o PreferredAuthentications=publickey)
+  fi
+
+  # the remote shell does not expand ~ after "=", so a leading ~/ becomes $HOME/
+  MYSQL_OPT=""
+  case "$MYSQL_DEFAULTS" in
+    "") ;;
+    "~/"*) MYSQL_OPT="--defaults-extra-file=\$HOME/${MYSQL_DEFAULTS#\~/}" ;;
+    *) MYSQL_OPT="--defaults-extra-file=$MYSQL_DEFAULTS" ;;
+  esac
+}
+
+remote() {
+  ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "$@"
+}
+
+describe_source() {
+  local where="$SSH_TARGET"
+  [ -n "$SSH_PORT" ] && where="$where:$SSH_PORT"
+  printf '%s (%s' "$SOURCE" "$where"
+  [ -n "$REMOTE_DB" ] && printf ', database %s' "$REMOTE_DB"
+  printf ')'
+}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# tables
+# ---------------------------------------------------------------------------------------------------------------------
+
+matches_any() {
+  local name="$1" pattern
+  shift
+  for pattern in "$@"; do
+    # unquoted on purpose: pattern match, not string comparison
+    # shellcheck disable=SC2254
+    case "$name" in $pattern) return 0 ;; esac
+  done
+  return 1
+}
+
+# structure only = matches the empty list and is not wanted with rows
+is_emptied() {
+  # shellcheck disable=SC2086
+  matches_any "$1" $EMPTY_LIST && ! matches_any "$1" $WITH_LIST
+}
+
+add_mb() {
+  awk -v a="$1" -v b="$2" 'BEGIN { print a + b }'
+}
+
+# reads the table list of the remote database and sorts it into EMPTIED and the sizes
+resolve_tables() {
+  local query table mb rows mark pattern found
+  [ -n "$REMOTE_DB" ] || die "$(upper "$SOURCE")_DB is not set"
+
+  EMPTY_LIST="${SOURCE_EMPTY_TABLES//,/ }"
+  WITH_LIST="${WITH_DATA//,/ }"
+  is_yes "$ALL_DATA" && EMPTY_LIST=""
+
+  query="SELECT table_name, ROUND((data_length + index_length) / 1048576, 1), table_rows FROM information_schema.TABLES WHERE table_schema = '$REMOTE_DB' AND table_type = 'BASE TABLE' ORDER BY data_length + index_length DESC"
+  step "Reading the tables of '$REMOTE_DB' from $SSH_TARGET ..."
+  if ! TABLES="$(remote "mysql $MYSQL_OPT -N -B -e \"$query\"")" || [ -z "$TABLES" ]; then
+    die "could not read the tables of '$REMOTE_DB' on $SSH_TARGET (database name, credentials on the server, see README)"
+  fi
+  step_done
+
+  EMPTIED=""
+  EMPTIED_MB=0
+  KEPT_MB=0
+  SIZE_REPORT=""
+  while IFS=$'\t' read -r table mb rows; do
+    [ -n "$table" ] || continue
+    is_safe_name "$table" || die "unexpected table name on $SOURCE: $table"
+    if is_emptied "$table"; then
+      EMPTIED="$EMPTIED $table"
+      EMPTIED_MB="$(add_mb "$EMPTIED_MB" "$mb")"
+      mark="structure only"
+    else
+      KEPT_MB="$(add_mb "$KEPT_MB" "$mb")"
+      mark=""
+    fi
+    SIZE_REPORT="$SIZE_REPORT$(printf '%10s MB %12s rows  %-40s %s' "$mb" "$rows" "$table" "$mark")"$'\n'
+  done <<< "$TABLES"
+
+  # a pattern without a match is no error: the same list serves projects and sources with other tables
+  for pattern in $EMPTY_LIST; do
+    found=0
+    while IFS=$'\t' read -r table mb rows; do
+      # shellcheck disable=SC2254
+      case "$table" in $pattern) found=1; break ;; esac
+    done <<< "$TABLES"
+    [ "$found" = 1 ] || echo "    note: EMPTY_TABLES entry '$pattern' matches no table on $SOURCE"
+  done
+}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# dumps
+# ---------------------------------------------------------------------------------------------------------------------
+
+# A complete dump ends every mysqldump run with "-- Dump completed". One pass only: the exit status of gzip tells
+# whether the file is intact, grep -c counts the finished parts (it exits 1 for zero, so its status is not used).
+check_dump() {
+  local file="$1" expected="$2" count rc
+  step "Checking the dump ($(du -h "$file" | cut -f1) compressed) ..."
+  count="$(gzip -dc "$file" 2>/dev/null | grep -c '^-- Dump completed'; exit "${PIPESTATUS[0]}")"
+  rc=$?
+  [ "$rc" -eq 0 ] || { echo "remote-pull: the dump is not a valid gzip file: $file" >&2; return 1; }
+  if [ "${count:-0}" -lt "$expected" ]; then
+    echo "remote-pull: the dump is incomplete ($count of $expected parts finished): $file" >&2
+    return 1
+  fi
+  step_done
+}
+
+PART_FILE=""
+cleanup_part() {
+  [ -n "$PART_FILE" ] && rm -f "$PART_FILE"
+}
+
+action_db() {
+  local stamp file dump_opts ignore table remote_cmd parts
+  resolve_tables
+
+  echo "    with rows:      $KEPT_MB MB (data and index on $SOURCE)"
+  if [ -n "$EMPTIED" ]; then
+    echo "    structure only: $EMPTIED_MB MB -$EMPTIED"
+  else
+    echo "    structure only: none"
+  fi
+
+  mkdir -p "$DUMP_DIR" || die "cannot create $DUMP_DIR"
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  file="$DUMP_DIR/$SOURCE--$stamp.sql.gz"
+
+  dump_opts="--single-transaction --quick --no-tablespaces --default-character-set=utf8mb4 ${DUMP_OPTIONS:-}"
+  if [ -n "$EMPTIED" ]; then
+    ignore=""
+    for table in $EMPTIED; do ignore="$ignore --ignore-table=$REMOTE_DB.$table"; done
+    remote_cmd="{ mysqldump $MYSQL_OPT $dump_opts$ignore $REMOTE_DB && mysqldump $MYSQL_OPT --no-data --no-tablespaces $REMOTE_DB$EMPTIED; } | gzip -c"
+    parts=2
+  else
+    remote_cmd="mysqldump $MYSQL_OPT $dump_opts $REMOTE_DB | gzip -c"
+    parts=1
+  fi
+
+  step "Fetching the dump (mysqldump on $SOURCE, compressed transfer, no progress shown) ..."
+  PART_FILE="$file.part"
+  # remove the partial file on every abort, Ctrl-C included
+  trap cleanup_part EXIT INT TERM
+  remote "$remote_cmd" > "$PART_FILE" || die "fetching the dump failed, nothing was changed locally"
+  step_done
+  check_dump "$PART_FILE" "$parts" || exit 1
+  mv "$PART_FILE" "$file"
+  PART_FILE=""
+  trap - EXIT INT TERM
+  echo "    saved: $file"
+
+  # ddev pull expects the dump in .ddev/.downloads. A symlink keeps large dumps out of the project folder and so out
+  # of a Mutagen sync; the import action reads the target.
+  mkdir -p "$DOWNLOAD_DIR"
+  ln -sf "$file" "$DOWNLOAD_DIR/db.sql.gz"
+}
+
+action_import() {
+  local file stamp backup
+  file="$DOWNLOAD_DIR/db.sql.gz"
+  [ -L "$file" ] && file="$(readlink "$file")"
+  [ -f "$file" ] || die "no dump to import: $DOWNLOAD_DIR/db.sql.gz"
+
+  if is_yes "$BACKUP"; then
+    mkdir -p "$DUMP_DIR" || die "cannot create $DUMP_DIR"
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    backup="$DUMP_DIR/local--$stamp.sql.gz"
+    step "Backing up the local database (no progress shown) ..."
+    ddev export-db --gzip --file="$backup" || die "the backup failed, the local database was not changed"
+    step_done
+    echo "    saved: $backup ($(du -h "$backup" | cut -f1))"
+  else
+    echo "    no backup of the local database (BACKUP=0)"
+  fi
+
+  # ddev pull runs pre-import-db and post-import-db around this action, so the nested import skips them
+  step "Importing $file (drops the local database first) ..."
+  ddev import-db --skip-hooks --no-progress --file="$file" || die "the import failed"
+  step_done
+}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# files
+# ---------------------------------------------------------------------------------------------------------------------
+
+action_files() {
+  local path opts pattern rsh
+  if [ -z "$FILES" ]; then
+    echo "    no $(upper "$SOURCE")_FILES or FILES configured, no files pulled"
+    return 0
+  fi
+  [ -n "$REMOTE_ROOT" ] || die "$(upper "$SOURCE")_ROOT is not set (project root on the server)"
+  command -v rsync >/dev/null 2>&1 || die "rsync is not installed on this computer"
+
+  # rsync takes the ssh options as one string
+  rsh="ssh"
+  for opt in "${SSH_OPTS[@]}"; do rsh="$rsh $opt"; done
+
+  opts=(-rlptz --human-readable --stats -e "$rsh")
+  # GNU rsync can show the overall progress, the openrsync of macOS cannot
+  rsync --info=progress2 --version >/dev/null 2>&1 && opts+=(--info=progress2)
+  is_yes "$FILES_DELETE" && opts+=(--delete)
+  is_yes "$DRY_RUN" && opts+=(--dry-run --itemize-changes)
+  for pattern in $FILES_EXCLUDE; do opts+=(--exclude="$pattern"); done
+
+  for path in $FILES; do
+    path="${path%/}"
+    case "$path" in /*) die "FILES entries are relative to the project root: $path" ;; esac
+    is_safe_path "$path" || die "invalid FILES entry: $path"
+    mkdir -p "$PROJECT_ROOT/$path"
+    step "rsync $SOURCE:$REMOTE_ROOT/$path/ -> $path/$(is_yes "$DRY_RUN" && echo ' (dry run, nothing changed)')"
+    rsync "${opts[@]}" "$SSH_TARGET:$REMOTE_ROOT/$path/" "$PROJECT_ROOT/$path/" || die "rsync of $path failed"
+    step_done
+  done
+}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# remote-pull command
+# ---------------------------------------------------------------------------------------------------------------------
+
+action_sizes() {
+  resolve_tables
+  echo
+  echo "Tables of '$REMOTE_DB' on $SOURCE (data and index):"
+  printf '%s' "$SIZE_REPORT"
+  echo
+  echo "With rows: $KEPT_MB MB, structure only: $EMPTIED_MB MB"
+}
+
+action_check() {
+  local ok=0 path
+  echo "Source $(describe_source)"
+  [ -n "$SSH_KEY_USED" ] && echo "  key:   $SSH_KEY_USED" || echo "  key:   from ssh-agent or ~/.ssh/config"
+
+  if remote true; then
+    echo "  [OK]   ssh login"
+  else
+    echo "  [FAIL] ssh login without a prompt failed. A key with passphrase has to be in the ssh-agent (ssh-add)."
+    return 1
+  fi
+
+  if [ -n "$REMOTE_DB" ]; then
+    if remote "mysql $MYSQL_OPT -N -B -e \"SELECT COUNT(*) FROM information_schema.TABLES WHERE table_schema = '$REMOTE_DB'\"" | grep -q '^[1-9]'; then
+      echo "  [OK]   database $REMOTE_DB readable"
+    else
+      echo "  [FAIL] database $REMOTE_DB not readable (credentials on the server, see README)"
+      ok=1
+    fi
+    remote "command -v mysqldump >/dev/null && command -v gzip >/dev/null" \
+      && echo "  [OK]   mysqldump and gzip on the server" \
+      || { echo "  [FAIL] mysqldump or gzip missing on the server"; ok=1; }
+  else
+    echo "  [--]   no $(upper "$SOURCE")_DB, database pull not configured"
+  fi
+
+  if [ -n "$FILES" ]; then
+    remote "command -v rsync >/dev/null" \
+      && echo "  [OK]   rsync on the server" \
+      || { echo "  [FAIL] rsync missing on the server"; ok=1; }
+    for path in $FILES; do
+      path="${path%/}"
+      if is_safe_path "$path" && [ -n "$REMOTE_ROOT" ] && remote "test -d $REMOTE_ROOT/$path/"; then
+        echo "  [OK]   $REMOTE_ROOT/$path"
+      else
+        echo "  [FAIL] $REMOTE_ROOT/$path not found on the server"
+        ok=1
+      fi
+    done
+  else
+    echo "  [--]   no FILES, file pull not configured"
+  fi
+  return $ok
+}
+
+usage() {
+  cat <<EOF
+Usage: remote-pull <action> <source>
+
+Actions of the providers (ddev pull <source>): info, auth, db, import, files
+Actions of "ddev remote-pull":                 sizes, check, sources
+EOF
+}
+
+ACTION="${1:-}"
+SOURCE="${2:-}"
+
+# names given with "ddev pull --environment", before the config files are read
+OVERRIDE_NAMES=""
+for __name in $OVERRIDABLE; do
+  [ -n "${!__name+x}" ] && OVERRIDE_NAMES="$OVERRIDE_NAMES $__name"
+done
+
+case "$ACTION" in
+  -h|--help|help|"") usage; exit 0 ;;
+  sources)
+    load_config
+    echo "${SOURCES:-}"
+    exit 0
+    ;;
+esac
+
+[ -n "$SOURCE" ] || { usage >&2; exit 1; }
+load_config
+load_source
+
+case "$ACTION" in
+  info)   describe_source; echo ;;
+  auth)
+    remote true || die "ssh to $SSH_TARGET failed without a prompt. Check with \"ddev remote-pull check $SOURCE\"; a key with passphrase has to be in the ssh-agent (ssh-add)."
+    ;;
+  db)     action_db ;;
+  import) action_import ;;
+  files)  action_files ;;
+  sizes)  action_sizes ;;
+  check)  action_check ;;
+  *)      usage >&2; exit 1 ;;
+esac

@@ -1,0 +1,67 @@
+#ddev-generated
+# Settings of remote-pull. "ddev add-on get" copies this file to .ddev/remote-pull/config once; commit that file,
+# updates leave it alone. Format KEY="value", lists separated by spaces. Never put passwords here: the database
+# credentials stay on the server (see README).
+#
+# Personal settings, like your own key, go to .ddev/remote-pull/config.local (ignored by git) or to the variable
+# REMOTE_PULL_SSH_KEY in your shell profile.
+#
+# Check the setup with "ddev remote-pull check", then pull with "ddev pull live" or "ddev pull stage".
+
+# Sources with a provider in .ddev/providers/. live and stage come with the add-on.
+SOURCES="live stage"
+
+# --- per source: <SOURCE>_<NAME>; a <NAME> without prefix is the default for every source ----------------------------
+
+# ssh target: user@host or a Host of ~/.ssh/config
+#LIVE_SSH="user@live.example.com"
+#LIVE_PORT="22"
+#STAGE_SSH="user@stage.example.com"
+
+# private key; empty: ssh-agent and ~/.ssh/config decide. A key with passphrase has to be in the ssh-agent,
+# the providers cannot ask for it.
+#SSH_KEY="~/.ssh/id_ed25519"
+
+# database on the server. mysql and mysqldump read the credentials from ~/.my.cnf of the server account,
+# or from this option file on the server.
+#LIVE_DB="project_live"
+#LIVE_MYSQL_DEFAULTS="~/live.my.cnf"
+#STAGE_DB="project_stage"
+
+# project root on the server (the release folder or its "current" symlink)
+#LIVE_ROOT="/var/www/project/current"
+#STAGE_ROOT="/var/www/project-stage/current"
+
+# --- database --------------------------------------------------------------------------------------------------------
+
+# Tables pulled as structure only, without rows. A * stands for any characters; patterns without a match are skipped.
+# Options of one run: --environment="EMPTY_TABLES=..." replaces the list, "WITH_DATA=..." takes tables back,
+# "ALL_DATA=1" pulls everything. Per source: LIVE_EMPTY_TABLES.
+#
+# TYPO3:
+#EMPTY_TABLES="cache_* cf_* sys_log sys_history be_sessions fe_sessions"
+# MODX (prefix modx_):
+#EMPTY_TABLES="modx_session modx_manager_log modx_versionx_* modx_seosuite_url"
+
+# Additional mysqldump options, e.g. "--routines" (needs the right privileges on the server)
+#DUMP_OPTIONS=""
+
+# Remote dumps and local backups are kept here, outside the project and so out of git and Mutagen.
+# Nothing is deleted automatically.
+#DUMP_DIR="~/ddev-remote-pull/<project>"
+
+# Back up the local database before the import: 1 or 0. One run: --environment="BACKUP=0"
+#BACKUP="1"
+
+# --- files -----------------------------------------------------------------------------------------------------------
+
+# Folders relative to the project root, the same on the server and locally. Empty: no files are pulled.
+#
+# TYPO3:
+#FILES="public/fileadmin"
+#FILES_EXCLUDE="_processed_ _temp_"
+# MODX:
+#FILES="site/assets/images site/assets/uploads"
+
+# Remove local files that are gone on the server: 1 or 0. One run: --environment="FILES_DELETE=1"
+#FILES_DELETE="0"

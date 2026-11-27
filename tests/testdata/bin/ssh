@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Stand-in for ssh in the tests: skips the options and the target and runs the command here.
+# Database commands run in the web container, where mysql and mysqldump reach the project database,
+# so the project database plays the remote one.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o|-p|-i|-l|-e) shift 2 ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+shift
+cmd="$*"
+case "$cmd" in
+  *mysql*) exec ddev exec bash -c "$cmd" ;;
+  *) exec bash -c "$cmd" ;;
+esac
